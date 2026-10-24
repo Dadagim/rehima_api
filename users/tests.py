@@ -1,162 +1,185 @@
-from unittest.mock import patch
+import tempfile
+from io import BytesIO
 
 from django.contrib.auth.models import User
-from django.test import RequestFactory, TestCase, override_settings
-from rest_framework.exceptions import AuthenticationFailed
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase, override_settings
+from PIL import Image
 from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from .authentication import ClerkAuthentication, verify_clerk_token
-from .clerk import AccountLinkConflict, ClerkConfigurationError, sync_clerk_user
 from .models import UserProfile
 
 
-class ClerkUserProvisioningTests(TestCase):
+class EmailAuthenticationTests(TestCase):
     def setUp(self):
-        self.identity = {
-            'id': 'user_clerk_123',
-            'username': 'new-member',
-            'first_name': 'New',
-            'last_name': 'Member',
-            'primary_email_address_id': 'email_primary',
-            'email_addresses': [
-                {
-                    'id': 'email_primary',
-                    'email_address': 'member@example.com',
-                    'verification': {'status': 'verified'},
-                },
-            ],
-            'primary_phone_number_id': 'phone_primary',
-            'phone_numbers': [
-                {'id': 'phone_primary', 'phone_number': '+61123456789'},
-            ],
-        }
+        self.client = APIClient()
 
-    @patch('users.clerk.fetch_clerk_user')
-    def test_verified_email_links_existing_profile_and_preserves_role(self, fetch_user):
-        existing = User.objects.create_user(
-            username='existing-member',
-            email='member@example.com',
-            password='Strong-password-123!',
+    def test_registration_creates_member_and_returns_jwt_pair(self):
+        response = self.client.post(
+            '/users/auth/register/',
+            {
+                'email': 'new-member@example.com',
+                'password': 'Strong-password-123!',
+                'password_confirm': 'Strong-password-123!',
+                'full_name': 'New Member',
+            },
+            format='json',
         )
-        profile = UserProfile.objects.create(
-            user=existing,
-            full_name='Existing Member',
-            phone_number='0400000000',
-            role='coach',
-        )
-        fetch_user.return_value = self.identity
 
-        linked = sync_clerk_user('user_clerk_123')
-
-        profile.refresh_from_db()
-        self.assertEqual(linked, existing)
-        self.assertEqual(profile.clerk_id, 'user_clerk_123')
-        self.assertEqual(profile.role, 'coach')
-        self.assertEqual(profile.full_name, 'Existing Member')
-        self.assertEqual(profile.phone_number, '0400000000')
-
-    @patch('users.clerk.fetch_clerk_user')
-    def test_new_clerk_user_gets_member_profile_without_local_password(self, fetch_user):
-        fetch_user.return_value = self.identity
-
-        user = sync_clerk_user('user_clerk_123')
-
-        self.assertEqual(user.email, 'member@example.com')
-        self.assertFalse(user.has_usable_password())
-        self.assertEqual(user.profile.clerk_id, 'user_clerk_123')
-        self.assertEqual(user.profile.role, 'member')
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIn('access', response.data)
+        self.assertIn('refresh', response.data)
+        user = User.objects.get(email='new-member@example.com')
+        self.assertTrue(user.check_password('Strong-password-123!'))
         self.assertEqual(user.profile.full_name, 'New Member')
-        self.assertEqual(user.profile.phone_number, '+61123456789')
-        self.assertFalse(user.profile.profile)
+        self.assertEqual(user.profile.role, 'member')
+        self.assertFalse(user.is_staff)
 
-    @patch('users.clerk.fetch_clerk_user')
-    def test_unverified_email_does_not_link_existing_account(self, fetch_user):
-        existing = User.objects.create_user(
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {response.data['access']}",
+        )
+        profile_response = self.client.get('/users/me/')
+        self.assertEqual(profile_response.status_code, 200)
+        self.assertEqual(profile_response.data['user']['email'], user.email)
+
+    def test_login_authenticates_email_case_insensitively(self):
+        User.objects.create_user(
+            username='existing-member',
+            email='Member@example.com',
+            password='Strong-password-123!',
+        )
+
+        response = self.client.post(
+            '/users/auth/login/',
+            {
+                'email': 'member@EXAMPLE.com',
+                'password': 'Strong-password-123!',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertIn('access', response.data)
+        self.assertIn('refresh', response.data)
+
+    def test_login_rejects_invalid_password_with_generic_error(self):
+        User.objects.create_user(
             username='existing-member',
             email='member@example.com',
             password='Strong-password-123!',
         )
-        fetch_user.return_value = {
-            **self.identity,
-            'email_addresses': [
-                {
-                    'id': 'email_primary',
-                    'email_address': 'member@example.com',
-                    'verification': {'status': 'unverified'},
-                },
-            ],
-        }
 
-        user = sync_clerk_user('user_clerk_123')
+        response = self.client.post(
+            '/users/auth/login/',
+            {'email': 'member@example.com', 'password': 'wrong-password'},
+            format='json',
+        )
 
-        self.assertNotEqual(user, existing)
-        self.assertEqual(user.email, '')
-        self.assertFalse(UserProfile.objects.filter(user=existing, clerk_id__isnull=False).exists())
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['detail'][0], 'Invalid email or password.')
 
-    @patch('users.clerk.fetch_clerk_user')
-    def test_duplicate_existing_email_is_rejected(self, fetch_user):
-        for username in ('first', 'second'):
+    def test_login_rejects_ambiguous_duplicate_emails(self):
+        for username in ('first-member', 'second-member'):
             User.objects.create_user(
                 username=username,
                 email='member@example.com',
                 password='Strong-password-123!',
             )
-        fetch_user.return_value = self.identity
 
-        with self.assertRaises(AccountLinkConflict):
-            sync_clerk_user('user_clerk_123')
-
-    @patch('users.authentication.sync_clerk_user')
-    @patch('users.authentication.verify_clerk_token')
-    def test_bearer_token_authenticates_linked_django_user(self, verify_token, sync_user):
-        user = User.objects.create_user(username='member', password='password')
-        verify_token.return_value = {'sub': 'user_clerk_123'}
-        sync_user.return_value = user
-        request = RequestFactory().get(
-            '/',
-            HTTP_AUTHORIZATION='Bearer clerk-session-token',
+        response = self.client.post(
+            '/users/auth/login/',
+            {
+                'email': 'member@example.com',
+                'password': 'Strong-password-123!',
+            },
+            format='json',
         )
 
-        result = ClerkAuthentication().authenticate(request)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['detail'][0], 'Invalid email or password.')
 
-        self.assertEqual(result, (user, {'sub': 'user_clerk_123'}))
-        verify_token.assert_called_once_with('clerk-session-token')
-        sync_user.assert_called_once_with('user_clerk_123')
+    def test_registration_rejects_duplicate_email_and_password_mismatch(self):
+        User.objects.create_user(
+            username='existing-member',
+            email='member@example.com',
+            password='Strong-password-123!',
+        )
+        duplicate = self.client.post(
+            '/users/auth/register/',
+            {
+                'email': 'MEMBER@example.com',
+                'password': 'Strong-password-123!',
+                'password_confirm': 'Strong-password-123!',
+            },
+            format='json',
+        )
+        mismatch = self.client.post(
+            '/users/auth/register/',
+            {
+                'email': 'new-member@example.com',
+                'password': 'Strong-password-123!',
+                'password_confirm': 'Different-password-123!',
+            },
+            format='json',
+        )
 
-    @override_settings(
-        CLERK_ISSUER='https://example.clerk.accounts.dev',
-        CLERK_JWKS_URL='https://example.clerk.accounts.dev/.well-known/jwks.json',
-        CLERK_AUTHORIZED_PARTIES=['http://localhost:5173'],
-    )
-    @patch('users.authentication.jwt.decode')
-    @patch('users.authentication.jwt.PyJWKClient')
-    def test_wrong_authorized_party_is_rejected(self, jwks_client, decode):
-        jwks_client.return_value.get_signing_key_from_jwt.return_value = type(
-            'SigningKey',
-            (),
-            {'key': 'public-key'},
-        )()
-        decode.return_value = {
-            'sub': 'user_clerk_123',
-            'azp': 'https://attacker.example',
-        }
+        self.assertEqual(duplicate.status_code, 400)
+        self.assertIn('email', duplicate.data)
+        self.assertEqual(mismatch.status_code, 400)
+        self.assertIn('password_confirm', mismatch.data)
 
-        with self.assertRaises(AuthenticationFailed):
-            verify_clerk_token(b'clerk-session-token')
+    def test_refresh_rotates_token_and_logout_blacklists_refresh_token(self):
+        user = User.objects.create_user(
+            username='existing-member',
+            email='member@example.com',
+            password='Strong-password-123!',
+        )
+        refresh = RefreshToken.for_user(user)
+        old_refresh = str(refresh)
 
-    @override_settings(
-        CLERK_ISSUER='',
-        CLERK_JWKS_URL='',
-        CLERK_AUTHORIZED_PARTIES=[],
-    )
-    def test_missing_clerk_settings_raise_a_clear_api_configuration_error(self):
-        with self.assertRaises(ClerkConfigurationError) as error:
-            verify_clerk_token('clerk-session-token')
+        refreshed = self.client.post(
+            '/users/auth/token/refresh/',
+            {'refresh': old_refresh},
+            format='json',
+        )
+        self.assertEqual(refreshed.status_code, 200, refreshed.data)
+        self.assertIn('access', refreshed.data)
+        self.assertIn('refresh', refreshed.data)
+        self.assertNotEqual(refreshed.data['refresh'], old_refresh)
 
-        self.assertEqual(error.exception.status_code, 503)
+        logout = self.client.post(
+            '/users/auth/logout/',
+            {'refresh': refreshed.data['refresh']},
+            format='json',
+        )
+        self.assertEqual(logout.status_code, 200, logout.data)
+
+        reused_refresh = self.client.post(
+            '/users/auth/token/refresh/',
+            {'refresh': refreshed.data['refresh']},
+            format='json',
+        )
+        self.assertEqual(reused_refresh.status_code, 401)
 
 
 class MeViewTests(TestCase):
+    def setUp(self):
+        self.media_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.media_dir.cleanup)
+        media_settings = override_settings(MEDIA_ROOT=self.media_dir.name)
+        media_settings.enable()
+        self.addCleanup(media_settings.disable)
+
+    def image_upload(self):
+        image = BytesIO()
+        Image.new('RGB', (1, 1), color='white').save(image, format='PNG')
+        return SimpleUploadedFile(
+            'profile.png',
+            image.getvalue(),
+            content_type='image/png',
+        )
+
     def test_superuser_without_profile_can_load_me_endpoint(self):
         user = User.objects.create_superuser(
             username='site-admin',
@@ -171,3 +194,74 @@ class MeViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.data['user_profile'])
         self.assertTrue(response.data['user']['is_superuser'])
+
+    def test_profile_completion_creates_profile_for_user_without_one(self):
+        user = User.objects.create_user(username='new-member', password='password')
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        response = client.post(
+            '/users/me/profile/',
+            {
+                'full_name': 'New Member',
+                'phone_number': '0400000000',
+                'attendance_plan_per_week': '3',
+                'profile': self.image_upload(),
+            },
+            format='multipart',
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        profile = user.profile
+        self.assertEqual(profile.full_name, 'New Member')
+        self.assertEqual(profile.phone_number, '0400000000')
+        self.assertEqual(profile.attendance_plan_per_week, '3')
+        self.assertTrue(profile.profile)
+        self.assertEqual(profile.role, 'member')
+
+    def test_profile_completion_requires_picture_for_incomplete_profile(self):
+        user = User.objects.create_user(username='new-member', password='password')
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        response = client.post(
+            '/users/me/profile/',
+            {
+                'full_name': 'New Member',
+                'phone_number': '0400000000',
+                'attendance_plan_per_week': '3',
+            },
+            format='multipart',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('profile', response.data)
+        self.assertFalse(UserProfile.objects.filter(user=user).exists())
+
+    def test_profile_completion_does_not_change_role_or_rewards(self):
+        user = User.objects.create_user(username='coach', password='password')
+        profile = UserProfile.objects.create(
+            user=user,
+            role='coach',
+            coins_balance=25,
+        )
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        response = client.post(
+            '/users/me/profile/',
+            {
+                'full_name': 'Coach User',
+                'phone_number': '0400000000',
+                'attendance_plan_per_week': '4',
+                'profile': self.image_upload(),
+                'role': 'admin',
+                'coins_balance': '9999',
+            },
+            format='multipart',
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        profile.refresh_from_db()
+        self.assertEqual(profile.role, 'coach')
+        self.assertEqual(profile.coins_balance, 25)

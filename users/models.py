@@ -12,7 +12,6 @@ ROLE_CHOICES = (
 
 class UserProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
-    clerk_id = models.CharField(max_length=255, unique=True, null=True, blank=True)
     full_name = models.CharField(max_length=100, blank=True, default='')
     phone_number = models.CharField(max_length=20, blank=True, default='')
     attendance_plan_per_week = models.CharField(max_length=20, blank=True, default='')

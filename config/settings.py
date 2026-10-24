@@ -11,7 +11,10 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import os
+from datetime import timedelta
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
 
 
 def load_env_file(file_path):
@@ -40,9 +43,15 @@ load_env_file(BASE_DIR / '.env')
 SECRET_KEY = os.getenv('SECRET_KEY')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-
-ALLOWED_HOSTS = []
+DEBUG = os.getenv('DEBUG', 'true').lower() in {'1', 'true', 'yes'}
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv(
+        'ALLOWED_HOSTS',
+        'localhost,127.0.0.1,0.0.0.0',
+    ).split(',')
+    if host.strip()
+]
 
 # Application definition
 INSTALLED_APPS = [
@@ -53,6 +62,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     'core',
     'users',
@@ -90,13 +100,37 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 
 # Database
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.sqlite3',
+#         'NAME': BASE_DIR / 'db.sqlite3',
+#     }
+# }
+
+from dotenv import load_dotenv
+from urllib.parse import urlparse, parse_qsl
+
+load_dotenv()
+
+database_url = os.getenv('DATABASE_URL')
+if not database_url:
+    raise ImproperlyConfigured('DATABASE_URL must be configured for PostgreSQL.')
+
+database = urlparse(database_url)
+if database.scheme not in {'postgres', 'postgresql'} or not database.hostname:
+    raise ImproperlyConfigured('DATABASE_URL must be a valid PostgreSQL URL.')
+
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': database.path.lstrip('/'),
+        'USER': database.username,
+        'PASSWORD': database.password,
+        'HOST': database.hostname,
+        'PORT': database.port or 5432,
+        'OPTIONS': dict(parse_qsl(database.query)),
     }
 }
-
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -124,21 +158,19 @@ CORS_ALLOWED_ORIGINS = [
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'users.authentication.ClerkAuthentication',
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     )
 }
 
-CLERK_SECRET_KEY = os.getenv('CLERK_SECRET_KEY', '')
-CLERK_ISSUER = os.getenv('CLERK_ISSUER', '').rstrip('/')
-CLERK_JWKS_URL = os.getenv('CLERK_JWKS_URL', '')
-CLERK_AUTHORIZED_PARTIES = [
-    party.strip()
-    for party in os.getenv('CLERK_AUTHORIZED_PARTIES', '').split(',')
-    if party.strip()
-] or CORS_ALLOWED_ORIGINS
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=30),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
+}
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN') or os.getenv('TELEGRAM_BOT_KEY')
 
